@@ -3,6 +3,7 @@ package uz.notecam.app
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ContentValues
+import android.content.IntentSender
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -14,6 +15,8 @@ import android.location.Geocoder
 import android.location.Location
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
 import android.widget.Button
@@ -26,13 +29,17 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.core.app.ActivityCompat
+import androidx.activity.result.IntentSenderRequest
 import androidx.core.content.ContextCompat
 import androidx.exifinterface.media.ExifInterface
+import com.google.android.gms.common.api.ResolvableApiException
 import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.LocationSettingsRequest
 import com.google.android.gms.location.Priority
-import com.google.android.gms.tasks.CancellationTokenSource
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.text.SimpleDateFormat
@@ -65,6 +72,23 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var lastAddress: String = ""
 
     private val dateFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+
+    private var locationCallback: LocationCallback? = null
+    private val ticker = Handler(Looper.getMainLooper())
+    private val tickRunnable = object : Runnable {
+        override fun run() {
+            updateOverlay()                 // soat va GPS holatini yangilab turadi
+            ticker.postDelayed(this, 1000)
+        }
+    }
+
+    // GPS'ni yoqish uchun bir tugmali tizim oynasi javobini oladi
+    private val gpsResolutionLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.StartIntentSenderForResult()
+    ) {
+        // Foydalanuvchi "Ha" desa ham, "Yo'q" desa ham — joy so'rashni baribir boshlaymiz
+        if (hasLocationPermission()) requestUpdates()
+    }
 
     private val permLauncher = registerForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
@@ -103,6 +127,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        ticker.postDelayed(tickRunnable, 1000)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        ticker.removeCallbacks(tickRunnable)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        locationCallback?.let { fused.removeLocationUpdates(it) }
+    }
+
     // ---------------- Kamera ----------------
     private fun startCamera() {
         val future = ProcessCameraProvider.getInstance(this)
@@ -126,13 +165,53 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---------------- Joylashuv ----------------
-    @SuppressLint("MissingPermission")
+    private fun locationRequest(): LocationRequest =
+        LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 2000L)
+            .setMinUpdateIntervalMillis(1000L)
+            .build()
+
     private fun startLocation() {
-        // Oxirgi ma'lum joy — tez ko'rsatish uchun
+        updateOverlay() // ekranni darhol sana bilan ko'rsatamiz (qotib qolmasin)
+
+        // GPS yoqilganmi, tekshiramiz; o'chiq bo'lsa bir tugmali oyna chiqaramiz
+        val settingsReq = LocationSettingsRequest.Builder()
+            .addLocationRequest(locationRequest())
+            .setAlwaysShow(true)
+            .build()
+        LocationServices.getSettingsClient(this)
+            .checkLocationSettings(settingsReq)
+            .addOnSuccessListener { requestUpdates() }         // GPS yoqiq -> boshlaymiz
+            .addOnFailureListener { ex ->
+                if (ex is ResolvableApiException) {
+                    try {
+                        gpsResolutionLauncher.launch(
+                            IntentSenderRequest.Builder(ex.resolution).build()
+                        )
+                    } catch (e: IntentSender.SendIntentException) {
+                        requestUpdates()
+                    }
+                } else {
+                    // GPS'ni oynadan yoqib bo'lmasa — qo'lda yoqishni so'raymiz
+                    Toast.makeText(this, "Joylashuvni (GPS) qo'lda yoqing", Toast.LENGTH_LONG).show()
+                    requestUpdates()
+                }
+            }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun requestUpdates() {
+        if (!hasLocationPermission()) return
+        // Tez ko'rsatish uchun oxirgi ma'lum joy
         fused.lastLocation.addOnSuccessListener { loc -> loc?.let { onNewLocation(it) } }
-        // Aniq, yangi joy
-        fused.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, CancellationTokenSource().token)
-            .addOnSuccessListener { loc -> loc?.let { onNewLocation(it) } }
+        // Koordinata kelguncha uzluksiz so'raymiz
+        locationCallback?.let { fused.removeLocationUpdates(it) }
+        val cb = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                result.lastLocation?.let { onNewLocation(it) }
+            }
+        }
+        locationCallback = cb
+        fused.requestLocationUpdates(locationRequest(), cb, Looper.getMainLooper())
     }
 
     private fun onNewLocation(loc: Location) {
